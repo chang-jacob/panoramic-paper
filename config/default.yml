@@ -1,0 +1,7 @@
+default:
+  paths:
+    project_dir: /home/groups/plevriti/jachang4/panoramic-paper
+    oak_base: /oak/stanford/groups/plevriti/jachang4/panoramic-paper
+    data: /oak/stanford/groups/plevriti/jachang4/panoramic-paper/data
+    output: /oak/stanford/groups/plevriti/jachang4/panoramic-paper/output
+    scratch: /scratch/users/jachang4/panoramic-paper
