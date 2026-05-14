@@ -32,10 +32,10 @@ sim_log <- function(...) message(sprintf("[%s] %s", sim_stamp(), paste0(..., col
 
 cfg <- list(
   cache_tag = "intersample_breakpoint",
-  # Preview profile defaults (faster sanity-check run).
-  n_reps = 3L,
+  # Manuscript-quality defaults for the sample degradation study.
+  n_reps = 5L,
   n_patients_grid = c(10L, 20L, 30L, 40L, 50L),
-  n_truth_realizations_per_patient = 20L,
+  n_truth_realizations_per_patient = 100L,
   n_samples_per_patient_mean = 2.2,
   n_samples_per_patient_min = 1L,
   n_samples_per_patient_max = 4L,
@@ -45,7 +45,7 @@ cfg <- list(
   target_cells = 1900,
   radius_um = 25,
   stat = "local_comp_enrichment",
-  boot_nsim = 20L,
+  boot_nsim = 100L,
   boot_mode = "block",
   tile_size = 62.5,
   patient_log_sd = 0.35,
@@ -62,6 +62,10 @@ cfg <- list(
   seed_base = 811L,
   n_workers = 10L
 )
+
+if (exists("sim_cfg", inherits = TRUE)) {
+  cfg <- utils::modifyList(cfg, get("sim_cfg", inherits = TRUE))
+}
 
 cfg$cache_tag <- as.character(cfg$cache_tag)
 cfg$n_reps <- as.integer(cfg$n_reps)
@@ -909,9 +913,23 @@ cmp_long <- dplyr::bind_rows(
   df_est %>%
     dplyr::transmute(scenario, n_patients, replicate, feature_id, parameter = "tau2_patient", method = "panoramic", estimate = tau2_patient, truth = true_tau2_patient),
   df_est %>%
-    dplyr::transmute(scenario, n_patients, replicate, feature_id, parameter = "tau2_patient", method = "naive", estimate = tau2_patient_naive, truth = true_tau2_patient)
+    dplyr::transmute(scenario, n_patients, replicate, feature_id, parameter = "tau2_patient", method = "naive", estimate = tau2_patient_naive, truth = true_tau2_patient),
+  df_est %>%
+    dplyr::transmute(scenario, n_patients, replicate, feature_id, parameter = "tau2_sample", method = "panoramic", estimate = tau2_sample, truth = true_tau2_sample),
+  df_est %>%
+    dplyr::transmute(scenario, n_patients, replicate, feature_id, parameter = "tau2_sample", method = "naive", estimate = tau2_sample_naive, truth = true_tau2_sample)
 ) %>%
   dplyr::mutate(error = estimate - truth, abs_error = abs(error))
+
+perf_by_replicate <- cmp_long %>%
+  dplyr::group_by(scenario, n_patients, parameter, method, replicate) %>%
+  dplyr::summarise(
+    bias = mean(error, na.rm = TRUE),
+    rmse = sqrt(mean(error^2, na.rm = TRUE)),
+    mae = mean(abs_error, na.rm = TRUE),
+    n_features = dplyr::n_distinct(feature_id),
+    .groups = "drop"
+  )
 
 perf_by_feature <- cmp_long %>%
   dplyr::group_by(scenario, n_patients, parameter, method, feature_id) %>%
@@ -934,15 +952,33 @@ perf_by_pair <- perf_by_feature %>%
     bias, rmse, mae
   )
 
-perf_summary <- perf_by_feature %>%
+perf_summary <- perf_by_replicate %>%
   dplyr::group_by(scenario, n_patients, parameter, method) %>%
   dplyr::summarise(
     bias = mean(bias, na.rm = TRUE),
-    rmse = mean(rmse, na.rm = TRUE),
+    rmse_mean = mean(rmse, na.rm = TRUE),
     mae = mean(mae, na.rm = TRUE),
-    n_features = dplyr::n(),
+    n_features = max(n_features, na.rm = TRUE),
+    n_reps = sum(is.finite(rmse)),
+    rmse_sd = stats::sd(rmse, na.rm = TRUE),
     .groups = "drop"
-  )
+  ) %>%
+  dplyr::mutate(
+    rmse_se = dplyr::if_else(n_reps > 0L, rmse_sd / sqrt(n_reps), NA_real_),
+    rmse_ci_mult = dplyr::if_else(n_reps > 1L, stats::qt(0.975, df = n_reps - 1L), NA_real_),
+    rmse_ci_lower = dplyr::if_else(
+      n_reps > 1L,
+      pmax(0, rmse_mean - rmse_ci_mult * rmse_se),
+      rmse_mean
+    ),
+    rmse_ci_upper = dplyr::if_else(
+      n_reps > 1L,
+      rmse_mean + rmse_ci_mult * rmse_se,
+      rmse_mean
+    ),
+    rmse = rmse_mean
+  ) %>%
+  dplyr::select(-rmse_mean, -rmse_ci_mult)
 
 pair_cmp <- cmp_long %>%
   dplyr::select(scenario, n_patients, replicate, feature_id, parameter, method, abs_error) %>%
@@ -1017,12 +1053,19 @@ p_win <- ggplot(
 
 p_rmse <- ggplot(
   perf_summary,
-  aes(x = n_patients, y = rmse, color = method)
+  aes(x = n_patients, y = rmse, color = method, group = method)
 ) +
+  geom_ribbon(
+    aes(ymin = rmse_ci_lower, ymax = rmse_ci_upper, fill = method),
+    alpha = 0.18,
+    linewidth = 0,
+    color = NA
+  ) +
   geom_line(linewidth = 0.9) +
   geom_point(size = 2.0) +
   facet_grid(parameter ~ scenario, scales = "free_y") +
   scale_color_manual(values = c(panoramic = "#0072B2", naive = "#D55E00")) +
+  scale_fill_manual(values = c(panoramic = "#0072B2", naive = "#D55E00"), guide = "none") +
   labs(
     title = "RMSE comparison across breakpoint scenarios",
     x = "Number of patients",
@@ -1048,6 +1091,48 @@ p_rmse_pair <- ggplot(
   ) +
   theme_minimal()
 
+tau2_levels <- c("tau2_patient", "tau2_sample")
+
+p_rmse_tau2 <- ggplot(
+  perf_summary %>% dplyr::filter(parameter %in% tau2_levels),
+  aes(x = n_patients, y = rmse, color = method, group = method)
+) +
+  geom_ribbon(
+    aes(ymin = rmse_ci_lower, ymax = rmse_ci_upper, fill = method),
+    alpha = 0.18,
+    linewidth = 0,
+    color = NA
+  ) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 2.0) +
+  facet_grid(parameter ~ scenario, scales = "free_y") +
+  scale_color_manual(values = c(panoramic = "#0072B2", naive = "#D55E00")) +
+  scale_fill_manual(values = c(panoramic = "#0072B2", naive = "#D55E00"), guide = "none") +
+  labs(
+    title = "RMSE comparison across breakpoint scenarios for tau2",
+    x = "Number of patients",
+    y = "RMSE",
+    color = "Method"
+  ) +
+  theme_minimal()
+
+p_rmse_pair_tau2 <- ggplot(
+  perf_by_pair %>% dplyr::filter(parameter %in% tau2_levels),
+  aes(x = n_patients, y = rmse, color = celltype_pair, linetype = method, group = interaction(method, celltype_pair))
+) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 1.8) +
+  facet_grid(parameter ~ scenario, scales = "free_y") +
+  scale_color_manual(values = c("A->A" = "#1B9E77", "A->B" = "#D95F02", "B->A" = "#7570B3", "B->B" = "#E7298A")) +
+  labs(
+    title = "RMSE by cell-type pair across breakpoint scenarios for tau2",
+    x = "Number of patients",
+    y = "RMSE",
+    color = "Cell-type pair",
+    linetype = "Method"
+  ) +
+  theme_minimal()
+
 params_rds <- file.path(out_data_dir, "intersample_breakpoint_params.rds")
 truth_rds <- file.path(out_data_dir, "intersample_breakpoint_truth.rds")
 est_rds <- file.path(out_data_dir, "intersample_breakpoint_estimates.rds")
@@ -1056,6 +1141,7 @@ meta_rds <- file.path(out_data_dir, "intersample_breakpoint_sample_meta.rds")
 est_csv <- file.path(out_tbl_dir, "intersample_breakpoint_estimates.csv")
 fail_csv <- file.path(out_tbl_dir, "intersample_breakpoint_failures.csv")
 sample_meta_csv <- file.path(out_tbl_dir, "intersample_breakpoint_sample_meta.csv")
+perf_replicate_csv <- file.path(out_tbl_dir, "intersample_breakpoint_perf_by_replicate.csv")
 perf_feature_csv <- file.path(out_tbl_dir, "intersample_breakpoint_perf_by_feature.csv")
 perf_pair_csv <- file.path(out_tbl_dir, "intersample_breakpoint_perf_by_celltype_pair.csv")
 perf_summary_csv <- file.path(out_tbl_dir, "intersample_breakpoint_perf_summary.csv")
@@ -1066,6 +1152,8 @@ breakpoint_first_csv <- file.path(out_tbl_dir, "intersample_breakpoint_first_bre
 win_png <- file.path(out_fig_dir, "intersample_breakpoint_meta_win_heatmap.png")
 rmse_png <- file.path(out_fig_dir, "intersample_breakpoint_rmse_lines.png")
 rmse_pair_png <- file.path(out_fig_dir, "intersample_breakpoint_rmse_by_celltype_pair.png")
+rmse_tau2_png <- file.path(out_fig_dir, "intersample_breakpoint_rmse_tau2_lines.png")
+rmse_pair_tau2_png <- file.path(out_fig_dir, "intersample_breakpoint_rmse_tau2_by_celltype_pair.png")
 
 sim_safe_save_rds(run_params, params_rds)
 sim_safe_save_rds(list(truth_long = df_truth, truth_patient = truth_patient), truth_rds)
@@ -1075,6 +1163,7 @@ sim_safe_save_rds(df_sample_meta, meta_rds)
 sim_safe_write_csv(df_est, est_csv)
 if (nrow(df_fail) > 0L) sim_safe_write_csv(df_fail, fail_csv)
 if (nrow(df_sample_meta) > 0L) sim_safe_write_csv(df_sample_meta, sample_meta_csv)
+sim_safe_write_csv(perf_by_replicate, perf_replicate_csv)
 sim_safe_write_csv(perf_by_feature, perf_feature_csv)
 sim_safe_write_csv(perf_by_pair, perf_pair_csv)
 sim_safe_write_csv(perf_summary, perf_summary_csv)
@@ -1085,6 +1174,8 @@ sim_safe_write_csv(breakpoint_first, breakpoint_first_csv)
 ggsave(win_png, p_win, width = 10.5, height = 7.5, dpi = 300)
 ggsave(rmse_png, p_rmse, width = 13.5, height = 8.5, dpi = 300)
 ggsave(rmse_pair_png, p_rmse_pair, width = 14.5, height = 9.5, dpi = 300)
+ggsave(rmse_tau2_png, p_rmse_tau2, width = 13.5, height = 8.5, dpi = 300)
+ggsave(rmse_pair_tau2_png, p_rmse_pair_tau2, width = 14.5, height = 9.5, dpi = 300)
 
 message("\nSaved intersample breakpoint outputs:")
 message("  params: ", params_rds)
@@ -1094,7 +1185,7 @@ message("  sample meta: ", meta_rds)
 message("  performance summary: ", perf_summary_csv)
 message("  performance by cell-type pair: ", perf_pair_csv)
 message("  breakpoint summary: ", breakpoint_first_csv)
-message("  figures: ", win_png, " ; ", rmse_png, " ; ", rmse_pair_png)
+message("  figures: ", win_png, " ; ", rmse_png, " ; ", rmse_pair_png, " ; ", rmse_tau2_png, " ; ", rmse_pair_tau2_png)
 if (nrow(df_fail) > 0L) message("  failures: ", fail_csv)
 
 if (interactive()) {
@@ -1110,7 +1201,13 @@ if (interactive()) {
     breakpoint_signal = breakpoint_signal,
     breakpoint_table = breakpoint_tbl,
     breakpoint_first = breakpoint_first,
-    plots = list(meta_win_heatmap = p_win, rmse_lines = p_rmse, rmse_by_celltype_pair = p_rmse_pair)
+    plots = list(
+      meta_win_heatmap = p_win,
+      rmse_lines = p_rmse,
+      rmse_by_celltype_pair = p_rmse_pair,
+      rmse_tau2_lines = p_rmse_tau2,
+      rmse_tau2_by_celltype_pair = p_rmse_pair_tau2
+    )
   ), envir = .GlobalEnv)
 
   message("\nInteractive object created: sim_breakpoint")
@@ -1118,4 +1215,6 @@ if (interactive()) {
   print(p_win)
   print(p_rmse)
   print(p_rmse_pair)
+  print(p_rmse_tau2)
+  print(p_rmse_pair_tau2)
 }

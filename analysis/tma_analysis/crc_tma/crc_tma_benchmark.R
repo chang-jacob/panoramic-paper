@@ -22,6 +22,7 @@ suppressPackageStartupMessages({
 # ---- Analysis Parameters (edit in script) ----
 analysis_params <- list(
   spe_list_key = "one_per_patient", # all | one_per_patient | core_filtered | diffuse_only
+  spe_list_path = NULL,
   columns = list(
     cell_type = "cell_type",
     patient = "patient",
@@ -54,8 +55,44 @@ analysis_params <- list(
     latex_sig_only = TRUE,
     latex_alpha = 0.05,
     latex_print_console = TRUE
+  ),
+  inputs = list(
+    contrast_csv = NULL,
+    spatial_csv = NULL,
+    meta_csv = NULL
+  ),
+  output = list(
+    analysis_subdir = NULL
   )
 )
+
+merge_nested_lists <- function(base, override) {
+  if (is.null(override)) {
+    return(base)
+  }
+
+  override_names <- names(override)
+  if (is.null(override_names)) {
+    stop("analysis_params_override must be a named list.")
+  }
+
+  for (nm in override_names) {
+    if (nm %in% names(base) && is.list(base[[nm]]) && is.list(override[[nm]])) {
+      base[[nm]] <- merge_nested_lists(base[[nm]], override[[nm]])
+    } else {
+      base[[nm]] <- override[[nm]]
+    }
+  }
+
+  base
+}
+
+if (exists("analysis_params_override", inherits = TRUE)) {
+  analysis_params <- merge_nested_lists(
+    analysis_params,
+    get("analysis_params_override", inherits = TRUE)
+  )
+}
 
 # ---- Helpers ----
 parse_radii <- function(x) {
@@ -66,6 +103,140 @@ parse_radii <- function(x) {
   }
   y <- y[is.finite(y) & y > 0]
   sort(unique(y))
+}
+
+find_first_col <- function(tbl, candidates) {
+  hits <- intersect(candidates, colnames(tbl))
+  if (length(hits) == 0L) return(NA_character_)
+  hits[[1]]
+}
+
+pick_spicyr_coef <- function(spicy_fit) {
+  pval_df <- try(as.data.frame(spicy_fit$p.value), silent = TRUE)
+  coef_df <- try(as.data.frame(spicy_fit$coefficient), silent = TRUE)
+  if (inherits(pval_df, "try-error")) return(NA_character_)
+  pcols <- colnames(pval_df)
+  if (length(pcols) == 0L) return(NA_character_)
+
+  ccols <- if (!inherits(coef_df, "try-error")) colnames(coef_df) else character(0)
+  shared <- setdiff(intersect(pcols, ccols), c("(Intercept)", "Intercept", "intercept"))
+  if (length(shared) > 0L) {
+    preferred <- shared[grepl("condition|group|case|status|npos|nneg|met|benign", tolower(shared))]
+    if (length(preferred) > 0L) return(preferred[[1]])
+    return(shared[[1]])
+  }
+
+  preferred <- pcols[grepl("condition|group|case|status|npos|nneg|met|benign", tolower(pcols))]
+  if (length(preferred) > 0L) return(preferred[[1]])
+  pcols[[1]]
+}
+
+manual_spicyr_top_pairs <- function(spicy_fit, coef = NA_character_, n = 10000L, adj = "fdr") {
+  pval_df <- try(as.data.frame(spicy_fit$p.value), silent = TRUE)
+  coef_df <- try(as.data.frame(spicy_fit$coefficient), silent = TRUE)
+  comp_df <- try(as.data.frame(spicy_fit$comparison), silent = TRUE)
+  if (inherits(pval_df, "try-error") || inherits(coef_df, "try-error") || inherits(comp_df, "try-error")) {
+    stop("Could not parse spicyR result components (p.value/coefficient/comparison).")
+  }
+  if (!all(c("from", "to") %in% colnames(comp_df))) {
+    stop("spicyR comparison table missing required columns 'from' and 'to'.")
+  }
+
+  if (!is.character(coef) || length(coef) != 1L || is.na(coef) || !coef %in% colnames(pval_df)) {
+    coef <- pick_spicyr_coef(spicy_fit)
+  }
+  if (!is.character(coef) || length(coef) != 1L || is.na(coef) || !coef %in% colnames(pval_df)) {
+    stop("Failed to determine a valid spicyR p-value coefficient column.")
+  }
+
+  effect_col <- if (coef %in% colnames(coef_df)) {
+    coef
+  } else {
+    cand <- setdiff(intersect(colnames(coef_df), colnames(pval_df)), c("(Intercept)", "Intercept", "intercept"))
+    if (length(cand) == 0L) cand <- setdiff(colnames(coef_df), c("(Intercept)", "Intercept", "intercept"))
+    if (length(cand) == 0L) NA_character_ else cand[[1]]
+  }
+
+  n_pairs <- min(nrow(comp_df), nrow(pval_df))
+  if (!is.finite(n_pairs) || n_pairs < 1L) {
+    return(data.frame(
+      intercept = numeric(0),
+      coefficient = numeric(0),
+      p.value = numeric(0),
+      adj.pvalue = numeric(0),
+      from = character(0),
+      to = character(0),
+      stringsAsFactors = FALSE
+    ))
+  }
+
+  pvals <- suppressWarnings(as.numeric(pval_df[[coef]][seq_len(n_pairs)]))
+  intercept <- if ("(Intercept)" %in% colnames(coef_df)) suppressWarnings(as.numeric(coef_df[["(Intercept)"]][seq_len(n_pairs)])) else NA_real_
+  effect <- if (!is.na(effect_col)) suppressWarnings(as.numeric(coef_df[[effect_col]][seq_len(n_pairs)])) else NA_real_
+
+  out <- data.frame(
+    intercept = intercept,
+    coefficient = effect,
+    p.value = pvals,
+    adj.pvalue = if (any(is.finite(pvals))) p.adjust(pvals, method = adj) else rep(NA_real_, length(pvals)),
+    from = as.character(comp_df$from[seq_len(n_pairs)]),
+    to = as.character(comp_df$to[seq_len(n_pairs)]),
+    stringsAsFactors = FALSE
+  )
+  out <- out[order(out$p.value), , drop = FALSE]
+  if (is.finite(n) && n > 0L) out <- head(out, n = as.integer(n))
+  out
+}
+
+extract_spicyr_full_table <- function(spicy_fit, coef = NA_character_) {
+  pval_df <- try(as.data.frame(spicy_fit$p.value), silent = TRUE)
+  coef_df <- try(as.data.frame(spicy_fit$coefficient), silent = TRUE)
+  comp_df <- try(as.data.frame(spicy_fit$comparison), silent = TRUE)
+  if (inherits(pval_df, "try-error") || inherits(comp_df, "try-error")) {
+    stop("Could not parse spicyR result components (p.value/comparison).")
+  }
+  if (!all(c("from", "to") %in% colnames(comp_df))) {
+    stop("spicyR comparison table missing required columns 'from' and 'to'.")
+  }
+
+  if (!is.character(coef) || length(coef) != 1L || is.na(coef) || !coef %in% colnames(pval_df)) {
+    coef <- pick_spicyr_coef(spicy_fit)
+  }
+  if (!is.character(coef) || length(coef) != 1L || is.na(coef) || !coef %in% colnames(pval_df)) {
+    stop("Failed to determine a valid spicyR p-value coefficient column.")
+  }
+
+  effect_col <- NA_character_
+  if (!inherits(coef_df, "try-error")) {
+    effect_col <- if (coef %in% colnames(coef_df)) {
+      coef
+    } else {
+      cand <- setdiff(intersect(colnames(coef_df), colnames(pval_df)), c("(Intercept)", "Intercept", "intercept"))
+      if (length(cand) == 0L) cand <- setdiff(colnames(coef_df), c("(Intercept)", "Intercept", "intercept"))
+      if (length(cand) == 0L) NA_character_ else cand[[1]]
+    }
+  }
+
+  n_pairs <- min(nrow(comp_df), nrow(pval_df))
+  if (!is.finite(n_pairs) || n_pairs < 1L) {
+    return(data.frame(
+      ct1 = character(0),
+      ct2 = character(0),
+      effect_spicyr = numeric(0),
+      p_spicyr = numeric(0),
+      stringsAsFactors = FALSE
+    ))
+  }
+
+  out <- data.frame(
+    ct1 = as.character(comp_df$from[seq_len(n_pairs)]),
+    ct2 = as.character(comp_df$to[seq_len(n_pairs)]),
+    effect_spicyr = if (!is.na(effect_col)) suppressWarnings(as.numeric(coef_df[[effect_col]][seq_len(n_pairs)])) else NA_real_,
+    p_spicyr = suppressWarnings(as.numeric(pval_df[[coef]][seq_len(n_pairs)])),
+    stringsAsFactors = FALSE
+  )
+  out |>
+    dplyr::filter(!is.na(ct1), !is.na(ct2), nzchar(ct1), nzchar(ct2))
 }
 
 pair_key_dir <- function(ct1, ct2) {
@@ -498,6 +669,13 @@ write_latex_results <- isTRUE(reporting_params$write_latex_results)
 latex_sig_only <- isTRUE(reporting_params$latex_sig_only)
 latex_alpha <- as.numeric(reporting_params$latex_alpha)
 latex_print_console <- isTRUE(reporting_params$latex_print_console)
+analysis_subdir <- analysis_params$output$analysis_subdir
+if (is.null(analysis_subdir)) {
+  use_analysis_subdir <- FALSE
+} else {
+  analysis_subdir <- as.character(analysis_subdir[[1]])
+  use_analysis_subdir <- nzchar(analysis_subdir)
+}
 
 shared_helpers <- new.env(parent = baseenv())
 sys.source(file.path(project_root, "analysis", "tma_analysis", "tma_shared_helpers.R"), envir = shared_helpers)
@@ -513,6 +691,7 @@ if (length(tile_size) != 1L || is.na(tile_size) || !is.finite(tile_size) || tile
 }
 
 spe_list_key <- as.character(analysis_params$spe_list_key)
+spe_list_path_override <- analysis_params$spe_list_path
 spe_list_paths <- list(
   all = file.path(paths$data, "processed", "crc_tma", "crc_tma_spe_list.rds"),
   one_per_patient = file.path(paths$data, "processed", "crc_tma", "crc_tma_spe_list_one_per_patient.rds"),
@@ -525,7 +704,11 @@ list_output_dirs <- c(
   diffuse_only = "all_diffuse",
   all = "all"
 )
-spe_list_path <- spe_list_paths[[spe_list_key]]
+spe_list_path <- if (is.null(spe_list_path_override)) {
+  spe_list_paths[[spe_list_key]]
+} else {
+  as.character(spe_list_path_override[[1]])
+}
 list_dir <- list_output_dirs[[spe_list_key]]
 if (is.null(spe_list_path) || is.null(list_dir)) {
   stop("Invalid analysis_params$spe_list_key: ", spe_list_key)
@@ -546,8 +729,16 @@ if (length(group_order) != 2L || any(!nzchar(group_order))) {
   stop("analysis_params$group_order must contain exactly two non-empty group labels.")
 }
 
-tab_dir <- file.path(paths$output, "tables", "crc_tma", list_dir)
-fig_dir <- file.path(paths$output, "figures", "crc_tma", list_dir)
+tab_dir <- if (use_analysis_subdir) {
+  file.path(paths$output, "tables", "crc_tma", list_dir, analysis_subdir)
+} else {
+  file.path(paths$output, "tables", "crc_tma", list_dir)
+}
+fig_dir <- if (use_analysis_subdir) {
+  file.path(paths$output, "figures", "crc_tma", list_dir, analysis_subdir)
+} else {
+  file.path(paths$output, "figures", "crc_tma", list_dir)
+}
 benchmark_tab_dir <- file.path(tab_dir, "benchmark")
 benchmark_fig_dir <- file.path(fig_dir, "benchmark")
 dir.create(benchmark_tab_dir, recursive = TRUE, showWarnings = FALSE)
@@ -565,9 +756,22 @@ run_prefix <- paste0(
   "_t", tile_tag
 )
 
-contrast_csv <- file.path(tab_dir, paste0(run_prefix, "_contrast.csv"))
-spatial_csv <- file.path(tab_dir, paste0(run_prefix, "_spatialstats.csv"))
-meta_csv <- file.path(tab_dir, paste0(run_prefix, "_meta.csv"))
+input_params <- analysis_params$inputs
+contrast_csv <- if (is.null(input_params$contrast_csv)) {
+  file.path(tab_dir, paste0(run_prefix, "_contrast.csv"))
+} else {
+  as.character(input_params$contrast_csv[[1]])
+}
+spatial_csv <- if (is.null(input_params$spatial_csv)) {
+  file.path(tab_dir, paste0(run_prefix, "_spatialstats.csv"))
+} else {
+  as.character(input_params$spatial_csv[[1]])
+}
+meta_csv <- if (is.null(input_params$meta_csv)) {
+  file.path(tab_dir, paste0(run_prefix, "_meta.csv"))
+} else {
+  as.character(input_params$meta_csv[[1]])
+}
 if (!file.exists(contrast_csv)) stop("Missing PANORAMIC contrast CSV: ", contrast_csv)
 if (!file.exists(spatial_csv)) stop("Missing PANORAMIC spatialstats CSV: ", spatial_csv)
 if (isTRUE(write_latex_results) && !file.exists(meta_csv)) stop("Missing PANORAMIC meta CSV: ", meta_csv)
@@ -666,10 +870,36 @@ pheno <- sample_meta |>
   as.data.frame()
 spicyR::imagePheno(cell_exp) <- pheno
 
-spicy_subject_col <- analysis_params$spicy$subject_col
-spicy_subject_col <- as.character(spicy_subject_col)
-if (length(spicy_subject_col) != 1L || !nzchar(spicy_subject_col)) {
-  stop("analysis_params$spicy$subject_col must be one non-empty string.")
+group_levels_present <- unique(as.character(pheno$group))
+group_levels_present <- group_levels_present[!is.na(group_levels_present) & nzchar(group_levels_present)]
+if (length(group_levels_present) < 2L) {
+  stop(
+    "spicyR requires at least two non-empty groups. Found: ",
+    paste(group_levels_present, collapse = ", ")
+  )
+}
+
+spicy_subject_col_cfg <- analysis_params$spicy$subject_col
+spicy_subject_col_cfg <- if (is.null(spicy_subject_col_cfg)) {
+  NULL
+} else {
+  as.character(spicy_subject_col_cfg[[1]])
+}
+if (!is.null(spicy_subject_col_cfg) && !nzchar(spicy_subject_col_cfg)) {
+  spicy_subject_col_cfg <- NULL
+}
+
+patient_counts <- table(as.character(pheno$patient))
+has_repeated_patients <- any(patient_counts > 1L)
+spicy_subject_col <- if (!is.null(spicy_subject_col_cfg) && has_repeated_patients) {
+  spicy_subject_col_cfg
+} else {
+  NULL
+}
+if (is.null(spicy_subject_col)) {
+  message("spicyR: no repeated patients detected; using condition-only model (subject=NULL).")
+} else {
+  message("spicyR: detected repeated patients; using mixed model with subject='", spicy_subject_col, "'.")
 }
 
 rs_step <- as.numeric(analysis_params$spicy$rs_step_um)
@@ -694,19 +924,30 @@ spicy_fit <- spicyR::spicy(
 spicy_prefix <- file.path(benchmark_tab_dir, paste0(run_prefix, "_benchmark"))
 saveRDS(spicy_fit, paste0(spicy_prefix, "_spicyR_object.rds"))
 
-top_n <- as.integer(analysis_params$spicy$top_n)
-spicy_raw <- spicyR::topPairs(spicy_fit, n = top_n)
-readr::write_csv(as.data.frame(spicy_raw), paste0(spicy_prefix, "_spicyR_topPairs_raw.csv"))
-
-spicy_tbl <- data.frame(
-  ct1 = as.character(spicy_raw$from),
-  ct2 = as.character(spicy_raw$to),
-  effect_spicyr = as.numeric(spicy_raw$coefficient),
-  p_spicyr = as.numeric(spicy_raw$p.value),
-  stringsAsFactors = FALSE
+top_n <- suppressWarnings(as.integer(analysis_params$spicy$top_n))
+if (!is.finite(top_n) || top_n < 1L) top_n <- 10000L
+spicy_coef <- pick_spicyr_coef(spicy_fit)
+spicy_raw <- tryCatch(
+  {
+    if (is.character(spicy_coef) && length(spicy_coef) == 1L && !is.na(spicy_coef) && nzchar(spicy_coef)) {
+      spicyR::topPairs(spicy_fit, coef = spicy_coef, n = top_n)
+    } else {
+      spicyR::topPairs(spicy_fit, n = top_n)
+    }
+  },
+  error = function(e) {
+    warning(
+      "spicyR::topPairs failed (coef='", spicy_coef, "'): ", conditionMessage(e),
+      ". Falling back to manual extraction.",
+      call. = FALSE
+    )
+    manual_spicyr_top_pairs(spicy_fit, coef = spicy_coef, n = top_n)
+  }
 )
-spicy_tbl <- spicy_tbl |>
-  dplyr::filter(!is.na(ct1), !is.na(ct2), nzchar(ct1), nzchar(ct2))
+readr::write_csv(as.data.frame(spicy_raw), paste0(spicy_prefix, "_spicyR_topPairs_raw.csv"))
+spicy_tbl <- extract_spicyr_full_table(spicy_fit, coef = spicy_coef)
+readr::write_csv(spicy_tbl, paste0(spicy_prefix, "_spicyR_all_pairs_raw.csv"))
+
 spicy_tbl$fdr_spicyr <- p.adjust(spicy_tbl$p_spicyr, method = "fdr")
 spicy_tbl$pair_key_dir <- pair_key_dir(spicy_tbl$ct1, spicy_tbl$ct2)
 spicy_tbl$pair_key_undir <- pair_key_undir(spicy_tbl$ct1, spicy_tbl$ct2)
@@ -1009,6 +1250,13 @@ write_scatter(
   out_stub = file.path(benchmark_fig_dir, paste0(run_prefix, "_benchmark_pan_vs_spicyr_logp"))
 )
 
+write_pvalue_hist(
+  df = pan_tbl,
+  p_col = "p_panoramic",
+  title = "CRC TMA PANORAMIC p-value histogram",
+  out_stub = file.path(benchmark_fig_dir, paste0(run_prefix, "_benchmark_panoramic_pvalue_histogram")),
+  bins = 20L
+)
 write_pvalue_hist(
   df = ttest_tbl,
   p_col = "p_ttest",

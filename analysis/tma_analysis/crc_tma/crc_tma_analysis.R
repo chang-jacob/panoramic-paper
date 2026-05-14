@@ -92,8 +92,40 @@ analysis_params <- list(
     latex_sig_only = TRUE,
     latex_alpha = 0.05,
     latex_print_console = TRUE
+  ),
+
+  output = list(
+    analysis_subdir = NULL
   )
 )
+
+merge_nested_lists <- function(base, override) {
+  if (is.null(override)) {
+    return(base)
+  }
+
+  override_names <- names(override)
+  if (is.null(override_names)) {
+    stop("analysis_params_override must be a named list.")
+  }
+
+  for (nm in override_names) {
+    if (nm %in% names(base) && is.list(base[[nm]]) && is.list(override[[nm]])) {
+      base[[nm]] <- merge_nested_lists(base[[nm]], override[[nm]])
+    } else {
+      base[[nm]] <- override[[nm]]
+    }
+  }
+
+  base
+}
+
+if (exists("analysis_params_override", inherits = TRUE)) {
+  analysis_params <- merge_nested_lists(
+    analysis_params,
+    get("analysis_params_override", inherits = TRUE)
+  )
+}
 
 # ---- Run controls ----
 spe_list_key <- analysis_params$spe_list_key
@@ -151,10 +183,31 @@ latex_sig_only <- analysis_params$reporting$latex_sig_only
 latex_alpha <- analysis_params$reporting$latex_alpha
 latex_print_console <- analysis_params$reporting$latex_print_console
 
+# ---- Output parameters ----
+analysis_subdir <- analysis_params$output$analysis_subdir
+if (is.null(analysis_subdir)) {
+  use_analysis_subdir <- FALSE
+} else {
+  analysis_subdir <- as.character(analysis_subdir[[1]])
+  use_analysis_subdir <- nzchar(analysis_subdir)
+}
+
 # ---- Outputs ----
-interim_dir <- file.path(paths$data, "interim")
-tab_dir <- file.path(paths$output, "tables", "crc_tma", list_dir)
-fig_dir <- file.path(paths$output, "figures", "crc_tma", list_dir)
+interim_dir <- if (use_analysis_subdir) {
+  file.path(paths$data, "interim", "crc_tma", list_dir, analysis_subdir)
+} else {
+  file.path(paths$data, "interim")
+}
+tab_dir <- if (use_analysis_subdir) {
+  file.path(paths$output, "tables", "crc_tma", list_dir, analysis_subdir)
+} else {
+  file.path(paths$output, "tables", "crc_tma", list_dir)
+}
+fig_dir <- if (use_analysis_subdir) {
+  file.path(paths$output, "figures", "crc_tma", list_dir, analysis_subdir)
+} else {
+  file.path(paths$output, "figures", "crc_tma", list_dir)
+}
 dir.create(interim_dir, recursive = TRUE, showWarnings = FALSE)
 dir.create(tab_dir, recursive = TRUE, showWarnings = FALSE)
 dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
@@ -391,30 +444,33 @@ save_forest_outputs <- function(se_meta, contrast_tbl, fig_dir, run_prefix, grou
   control_group <- as.character(contrast_meta$control)
   case_group <- as.character(contrast_meta$case)
 
-  hits_ctrl <- select_forest_hits(
-    contrast_tbl,
-    sig_col = sig_col,
-    alpha = alpha,
-    top_n = top_n,
-    beta_sign = "negative"
-  )
-  hits_ctrl$direction_group <- control_group
-  hits_ctrl$direction_rank <- seq_len(nrow(hits_ctrl))
-
-  hits_case <- select_forest_hits(
-    contrast_tbl,
-    sig_col = sig_col,
-    alpha = alpha,
-    top_n = top_n,
-    beta_sign = "nonnegative"
-  )
-  hits_case$direction_group <- case_group
-  hits_case$direction_rank <- seq_len(nrow(hits_case))
-
-  if (nrow(hits_ctrl) == 0L || nrow(hits_case) == 0L) {
-    stop("Expected at least one significant hit in each direction for forest outputs.")
+  maybe_select_forest_hits <- function(beta_sign, direction_group) {
+    hits <- tryCatch(
+      select_forest_hits(
+        contrast_tbl,
+        sig_col = sig_col,
+        alpha = alpha,
+        top_n = top_n,
+        beta_sign = beta_sign
+      ),
+      error = function(e) NULL
+    )
+    if (is.null(hits) || nrow(hits) == 0L) {
+      return(NULL)
+    }
+    hits$direction_group <- direction_group
+    hits$direction_rank <- seq_len(nrow(hits))
+    hits
   }
-  hits <- dplyr::bind_rows(hits_ctrl, hits_case)
+
+  hits_ctrl <- maybe_select_forest_hits(beta_sign = "negative", direction_group = control_group)
+  hits_case <- maybe_select_forest_hits(beta_sign = "nonnegative", direction_group = case_group)
+  hit_tables <- Filter(function(x) !is.null(x) && nrow(x) > 0L, list(hits_ctrl, hits_case))
+  if (length(hit_tables) == 0L) {
+    message("No significant forest hits at alpha=", alpha, " using ", sig_col, "; skipping forest outputs.")
+    return(list(index = data.frame(), index_csv = NA_character_, dir = NA_character_, plots = list()))
+  }
+  hits <- dplyr::bind_rows(hit_tables)
 
   forest_dir <- file.path(fig_dir, paste0(run_prefix, "_forest"))
   dir.create(forest_dir, recursive = TRUE, showWarnings = FALSE)
@@ -502,8 +558,8 @@ save_forest_outputs <- function(se_meta, contrast_tbl, fig_dir, run_prefix, grou
   index_csv <- file.path(forest_dir, "forest_plot_index.csv")
   readr::write_csv(index_df, index_csv)
   message("Forest plots attempted: ", nrow(index_df))
-  message("Forest hits (higher in ", control_group, "): ", nrow(hits_ctrl))
-  message("Forest hits (higher in ", case_group, "): ", nrow(hits_case))
+  message("Forest hits (higher in ", control_group, "): ", if (is.null(hits_ctrl)) 0L else nrow(hits_ctrl))
+  message("Forest hits (higher in ", case_group, "): ", if (is.null(hits_case)) 0L else nrow(hits_case))
   if (isTRUE(show_plots) && nrow(index_df) > shown_count) {
     message("Displayed first ", shown_count, " forest plots in-session (adjust analysis_params$plotting$show_plots_max to change).")
   }
@@ -766,12 +822,13 @@ rep_out <- panoramic::plot_representative_samples(
   out_prefix = rep_prefix
 )
 if (!is.data.frame(rep_out$index) || nrow(rep_out$index) == 0L) {
-  stop("Representative panel generation returned no valid index rows.")
+  message("Representative panel generation returned no valid index rows; skipping representative sample index export.")
+} else {
+  rep_index_csv <- paste0(rep_prefix, "_index.csv")
+  write_csv(rep_out$index, rep_index_csv)
+  message("Representative hit panels written: ", nrow(rep_out$index))
+  message("Representative panel index CSV: ", rep_index_csv)
 }
-rep_index_csv <- paste0(rep_prefix, "_index.csv")
-write_csv(rep_out$index, rep_index_csv)
-message("Representative hit panels written: ", nrow(rep_out$index))
-message("Representative panel index CSV: ", rep_index_csv)
 
 save_network_outputs(se_meta = se_meta, fig_dir = fig_dir, run_prefix = run_prefix)
 
